@@ -75,6 +75,14 @@ def homepage() -> FileResponse:
     return FileResponse(APP_DIR / "static" / "index.html", media_type="text/html")
 
 
+@app.get("/health", include_in_schema=False)
+def health() -> dict[str, str]:
+    """Liveness/readiness check for the host (e.g. Render) -- cheap, no session state involved."""
+    if not TEMPLATE_PATH.is_file():
+        raise HTTPException(status_code=503, detail="The workbook blueprint is missing from the server.")
+    return {"status": "ok"}
+
+
 def default_workbook_name(sheet_titles: list[str]) -> str:
     label = " + ".join(sheet_titles) if len(sheet_titles) <= 3 else f"{sheet_titles[0]} + {len(sheet_titles) - 1} more"
     return safe_name(f"Plan Sheet - {label}", ".xlsx")
