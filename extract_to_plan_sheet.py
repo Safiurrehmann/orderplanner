@@ -1,205 +1,220 @@
 #!/usr/bin/env python3
-"""Extract purchase-order styles and write a PLAN SHEET workbook."""
+"""Build a multi-PO production plan workbook and place matched embroidery artwork."""
 
 from __future__ import annotations
 
-import argparse
-import base64
-import json
-import os
+import io
 import re
 import shutil
-import sys
-import urllib.error
-import urllib.request
 from copy import copy
 from pathlib import Path
 from typing import Any
 
 from openpyxl import load_workbook
+from openpyxl.drawing.image import Image as ExcelImage
+from PIL import Image as PILImage
 from pypdf import PdfReader
 
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+BLUEPRINT_SHEET = "WS72823"
 FIRST_DATA_ROW = 4
-SCHEMA: dict[str, Any] = {
-    "type": "object", "additionalProperties": False, "required": ["styles"],
-    "properties": {"styles": {"type": "array", "items": {
-        "type": "object", "additionalProperties": False,
-        "required": ["style_number", "color_code", "quantity"],
-        "properties": {"style_number": {"type": "string"}, "color_code": {"type": "string"},
-                       "quantity": {"type": "integer", "minimum": 0}}
-    }}}
-}
-SYSTEM_PROMPT = (
-    "You extract garment purchase-order line items. Return every distinct style/color line exactly once. "
-    "style_number is the printed style number or code, color_code is the printed short color code before "
-    "the color name (for example LTB in 'LTB - Light Blue'), and quantity "
-    "is that line's actual quantity. Do not invent values, calculate quantities, or include headings, totals, "
-    "size breakdowns, or non-style rows. Unavailable text is an empty string; unavailable quantity is 0."
-)
+LAST_COLUMN = 15  # A..O
+PRINT_LAST_COLUMN = "M"
+INVALID_SHEET_CHARS = re.compile(r"[:\\/?*\[\]]")
+# The blueprint's own sample back/front pictures at F4/G4, in pixels. Measured
+# directly from PLAN SHEET.xlsx's xl/drawings/drawing2.xml (WS72823's picture
+# <a:xfrm><a:ext cx="1296785" cy="342900"/> and cx="572775" cy="457200"/>,
+# EMU / 9525 = px) -- NOT from openpyxl's own Image.width/height, which does not
+# reliably round-trip a saved display size back out of an existing .xlsx.
+BACK_BOX = (136, 36)
+FRONT_BOX = (60, 48)
 
-def load_dotenv(path: Path) -> None:
-    if not path.exists():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            key, value = line.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+# Each artwork source is a per-contract spec-sheet JPG/PNG (a Royce Apparel /
+# Pressbox "tech pack" export) that contains, among other things, two garment
+# mockup photos AND two separate bordered boxes lower on the page holding the
+# actual isolated embroidery art -- a compact front/chest logo on the left and
+# a wide back wordmark on the right. Those two boxes are what get placed in
+# F/G; the mockup photos are not used. Box positions are calibrated as pixel
+# offsets against ARTWORK_REF_SIZE (measured from real sample files) and then
+# scaled to each upload's actual size, since exports vary by a few pixels.
+ARTWORK_REF_SIZE = (1508, 1134)
+FRONT_ART_BOX_REF = (37, 619, 498, 912)
+BACK_ART_BOX_REF = (562, 619, 1473, 912)
+_ARTWORK_REF_ASPECT = ARTWORK_REF_SIZE[0] / ARTWORK_REF_SIZE[1]
+
 
 def pdf_text(pdf_path: Path) -> str:
-    reader = PdfReader(str(pdf_path))
-    return "\n\n".join((page.extract_text() or "") for page in reader.pages).strip()
+    return "\n".join((page.extract_text() or "") for page in PdfReader(str(pdf_path)).pages)
 
-def pdf_images(pdf_path: Path) -> list[str]:
-    try:
-        import fitz
-    except ImportError as exc:
-        raise RuntimeError("Install PyMuPDF to use vision fallback.") from exc
-    document = fitz.open(pdf_path)
-    result = []
-    for page in document:
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-        result.append("data:image/png;base64," + base64.b64encode(pix.tobytes("png")).decode("ascii"))
-    return result
 
-def groq_request(messages: list[dict[str, Any]], model: str, strict: bool) -> dict[str, Any]:
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key or api_key == "replace_me":
-        raise RuntimeError("Set GROQ_API_KEY in your environment or .env file.")
-    response_format: dict[str, Any]
-    if strict:
-        response_format = {"type": "json_schema", "json_schema": {
-            "name": "purchase_order_styles", "strict": True, "schema": SCHEMA}}
-    else:
-        response_format = {"type": "json_object"}
-    payload = json.dumps({"model": model, "temperature": 0, "messages": messages,
-                          "response_format": response_format}).encode("utf-8")
-    request = urllib.request.Request(GROQ_URL, data=payload, method="POST", headers={
-        "Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            body = json.load(response)
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"Groq API returned HTTP {exc.code}: {exc.read().decode('utf-8', 'replace')}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Could not contact Groq: {exc.reason}") from exc
-    try:
-        return json.loads(body["choices"][0]["message"]["content"])
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"Groq returned an unexpected response: {body}") from exc
-
-def abbreviation(value: str) -> str:
-    return "".join(char for char in str(value).upper() if char.isalpha())[:3]
-
-def validate_styles(raw_styles: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    styles, seen = [], set()
-    for index, raw in enumerate(raw_styles, 1):
-        style, color = str(raw.get("style_number", "")).strip(), str(raw.get("color_code", "")).strip()
-        try:
-            quantity = int(raw.get("quantity", 0))
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(f"Row {index} has an invalid quantity.") from exc
-        if not abbreviation(style) or not abbreviation(color) or quantity < 0:
-            raise RuntimeError(f"Row {index} is missing style, color, or valid quantity: {raw}")
-        key = (style.upper(), color.upper())
-        if key in seen:
-            raise RuntimeError(f"Duplicate style/color returned: {style} / {color}")
-        seen.add(key)
-        styles.append({"emb": abbreviation(style), "main_body": abbreviation(color), "quantity": quantity})
-    if not styles:
-        raise RuntimeError("No style rows were returned. Try --vision or review the PDF.")
-    return styles
-
-# Disabled Groq implementation, retained for a later model-powered extractor.
-# Neither the command-line tool nor the web server calls this function.
-def extract_styles(pdf_path: Path, force_vision: bool = False) -> list[dict[str, Any]]:
-    text = "" if force_vision else pdf_text(pdf_path)
-    if len(text) >= 100:
-        result = groq_request([
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Extract styles from this purchase-order text:\n\n{text}"}],
-            os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b"), strict=True)
-    else:
-        content: list[dict[str, Any]] = [{"type": "text", "text": "Extract all styles from these PO pages."}]
-        content.extend({"type": "image_url", "image_url": {"url": image}} for image in pdf_images(pdf_path))
-        result = groq_request([{"role": "system", "content": SYSTEM_PROMPT},
-                               {"role": "user", "content": content}],
-                              os.environ.get("GROQ_VISION_MODEL", "qwen/qwen3.6-27b"), strict=False)
-    return validate_styles(result.get("styles", []))
-
-def extract_local_styles(pdf_path: Path) -> list[dict[str, Any]]:
-    """Deterministic fallback for this PO format when API access is unavailable."""
+def extract_purchase_order(pdf_path: Path) -> tuple[str, list[dict[str, Any]]]:
+    """Return the PO number and every printable line item in the Royce PO format."""
     text = pdf_text(pdf_path)
+    po_match = re.search(r"Purchase\s+Order\s+ID\s*(\d+)", text, re.IGNORECASE)
+    if not po_match:
+        raise RuntimeError(f"Could not find a Purchase Order ID in {pdf_path.name}.")
     pattern = re.compile(
-        r"^OS\n(\d+)\n[\d.]+\nReplace:\n([A-Z]{3})65999FGN\s*(?:[A-Z]{2,3}\s*)?([A-Z]{3}) -",
-        re.MULTILINE,
+        r"^OS\s*\n\s*(?P<quantity>\d+)\s*\n.*?^Replace:\s*\n\s*"
+        r"(?P<contract>[A-Z0-9-]+)\s*\n(?:\s*[A-Z]{2,4}\s*\n)?\s*"
+        r"(?P<color>[A-Z]{3})\s*-", re.MULTILINE | re.DOTALL,
     )
-    rows = [
-        {"style_number": match.group(2), "color_code": match.group(3), "quantity": int(match.group(1))}
-        for match in pattern.finditer(text)
-    ]
-    return validate_styles(rows)
+    rows: list[dict[str, Any]] = []
+    for match in pattern.finditer(text):
+        contract = match.group("contract").strip().upper()
+        emb = "".join(char for char in contract if char.isalpha())[:3]
+        if emb:
+            rows.append({"contract": contract, "emb": emb,
+                         "color": match.group("color").strip().upper(),
+                         "quantity": int(match.group("quantity"))})
+    if not rows:
+        raise RuntimeError(f"No purchase-order line items could be read from {pdf_path.name}.")
+    return po_match.group(1), rows
 
-def apply_row_style(sheet: Any, row: int, styles: list[Any], height: float | None) -> None:
+
+def safe_sheet_title(base: str, existing: set[str]) -> str:
+    """Sanitise a worksheet title, truncate to Excel's 31-char limit, and dedupe."""
+    cleaned = INVALID_SHEET_CHARS.sub("_", base).strip()[:31] or "Sheet"
+    title = cleaned
+    suffix = 2
+    while title in existing:
+        trim = 31 - len(f" ({suffix})")
+        title = f"{cleaned[:trim]} ({suffix})"
+        suffix += 1
+    existing.add(title)
+    return title
+
+
+def _copy_row_style(sheet: Any, row: int, styles: list[Any], height: float | None) -> None:
     for column, cell_style in enumerate(styles, start=1):
-        if cell_style is not None:
-            sheet.cell(row, column)._style = copy(cell_style)
+        sheet.cell(row, column)._style = copy(cell_style)
     sheet.row_dimensions[row].height = height
 
-def build_workbook(template_path: Path, output_path: Path, styles: list[dict[str, Any]]) -> None:
+
+def _populate_sheet(sheet: Any, po_number: str, rows: list[dict[str, Any]], row_styles: list[Any], row_height: float | None) -> None:
+    """Fill one blueprint-derived sheet with one PO's line items."""
+    sheet["D2"] = int(po_number) if po_number.isdigit() else po_number
+    for offset, item in enumerate(rows):
+        row = FIRST_DATA_ROW + offset
+        _copy_row_style(sheet, row, row_styles, row_height)
+        for column in range(1, LAST_COLUMN + 1):
+            sheet.cell(row, column).value = None
+        sheet.cell(row, 1).value = offset + 1
+        sheet.cell(row, 2).value = item["contract"]
+        sheet.cell(row, 3).value = item["emb"]
+        sheet.cell(row, 4).value = item["color"]
+        sheet.cell(row, 8).value = item["quantity"]
+        sheet.cell(row, 9).value = f"=H{row}+10"
+        sheet.cell(row, 10).value = f"=I{row}*0.933"
+        sheet.cell(row, 11).value = f"=I{row}*0.13"
+    total_row = FIRST_DATA_ROW + len(rows)
+    _copy_row_style(sheet, total_row, row_styles, row_height)
+    for column in range(1, LAST_COLUMN + 1):
+        sheet.cell(total_row, column).value = None
+    sheet.cell(total_row, 8).value = f"=SUM(H{FIRST_DATA_ROW}:H{total_row - 1})"
+    sheet.cell(total_row, 9).value = f"=SUM(I{FIRST_DATA_ROW}:I{total_row - 1})"
+    # The blueprint's print area only ever covered its sample rows; stretch it to
+    # cover every generated row (plus the totals row) so printing isn't cut off.
+    sheet.print_area = f"A1:{PRINT_LAST_COLUMN}{total_row}"
+
+
+def build_workbook(template_path: Path, output_path: Path, purchase_orders: list[tuple[str, list[dict[str, Any]]]]) -> dict[str, Any]:
+    """Create one blueprint-derived worksheet per uploaded PO.
+
+    Returns {"sheets": {sheet_title: rows}, "artwork_box": {"back": [w, h], "front": [w, h]}}.
+    """
+    if not purchase_orders:
+        raise RuntimeError("No purchase orders to build a workbook from.")
     shutil.copy2(template_path, output_path)
     workbook = load_workbook(output_path)
-    sheet = workbook.active
-    # Keep the format of the first sample row before removing sample data.
-    row_styles = [copy(sheet.cell(FIRST_DATA_ROW, column)._style) for column in range(1, 15)]
-    row_height = sheet.row_dimensions[FIRST_DATA_ROW].height
-    # Existing rows 4 through the last row are only example rows and their old total.
-    sheet.delete_rows(FIRST_DATA_ROW, sheet.max_row - FIRST_DATA_ROW + 1)
-    for offset, style in enumerate(styles):
-        row = FIRST_DATA_ROW + offset
-        apply_row_style(sheet, row, row_styles, row_height)
-        for column in range(1, 15):
-            sheet.cell(row, column).value = None
-        adjusted = style["quantity"] + 4
-        sheet.cell(row, 3).value = style["emb"]
-        sheet.cell(row, 4).value = style["main_body"]
-        sheet.cell(row, 7).value = style["quantity"]
-        sheet.cell(row, 8).value = adjusted
-        sheet.cell(row, 9).value = round(adjusted * 0.933, 3)
-        sheet.cell(row, 10).value = round(adjusted * 0.13, 3)
-    sheet.cell(3, 7).value = None
-    sheet.cell(3, 8).value = "QUANTITY"
-    total_row = FIRST_DATA_ROW + len(styles)
-    apply_row_style(sheet, total_row, row_styles, row_height)
-    for column in range(1, 15):
-        sheet.cell(total_row, column).value = None
-    sheet.cell(total_row, 7).value = f"=SUM(G{FIRST_DATA_ROW}:G{total_row - 1})"
-    sheet.cell(total_row, 8).value = f"=SUM(H{FIRST_DATA_ROW}:H{total_row - 1})"
+    if BLUEPRINT_SHEET not in workbook.sheetnames:
+        raise RuntimeError(f"The workbook blueprint is missing its {BLUEPRINT_SHEET} sheet.")
+    blueprint = workbook[BLUEPRINT_SHEET]
+    for candidate in list(workbook.worksheets):
+        if candidate is not blueprint:
+            workbook.remove(candidate)
+
+    # The blueprint ships with its own sample back/front artwork anchored at
+    # FIRST_DATA_ROW (that's where BACK_BOX/FRONT_BOX above were measured from).
+    # Strip it -- it's sample data, not something every generated sheet should
+    # carry forward -- before cloning, so no clone inherits it either.
+    blueprint._images = []
+
+    row_styles = [copy(blueprint.cell(FIRST_DATA_ROW, column)._style) for column in range(1, LAST_COLUMN + 1)]
+    row_height = blueprint.row_dimensions[FIRST_DATA_ROW].height
+    blueprint.delete_rows(FIRST_DATA_ROW, blueprint.max_row - FIRST_DATA_ROW + 1)
+
+    # Clone the now-blank, image-free blueprint once per extra PO (copy_worksheet
+    # preserves styles, column widths, merges and page setup, but not print_area,
+    # which _populate_sheet sets explicitly on every sheet below).
+    sheets = [blueprint]
+    for _ in purchase_orders[1:]:
+        sheets.append(workbook.copy_worksheet(blueprint))
+
+    existing_titles: set[str] = set()
+    sheet_rows: dict[str, list[dict[str, Any]]] = {}
+    for (po_number, rows), sheet in zip(purchase_orders, sheets):
+        sheet.title = safe_sheet_title(f"WS{po_number}", existing_titles)
+        _populate_sheet(sheet, po_number, rows, row_styles, row_height)
+        sheet_rows[sheet.title] = rows
     workbook.save(output_path)
+    return {"sheets": sheet_rows, "artwork_box": {"back": list(BACK_BOX), "front": list(FRONT_BOX)}}
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("pdf", type=Path, help="Purchase-order PDF")
-    parser.add_argument("--template", type=Path, default=Path("PLAN SHEET.xlsx"))
-    parser.add_argument("--output", type=Path)
-    parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
-    if not args.pdf.is_file() or not args.template.is_file():
-        parser.error("PDF or template path does not exist.")
-    styles = extract_local_styles(args.pdf)
-    print(json.dumps(styles, indent=2))
-    if args.dry_run:
-        return 0
-    output = args.output or Path("../output") / f"{args.pdf.stem}_output.xlsx"
-    output.parent.mkdir(parents=True, exist_ok=True)
-    build_workbook(args.template, output, styles)
-    print(f"Wrote {len(styles)} styles to {output.resolve()}")
-    return 0
 
-if __name__ == "__main__":
+def find_known_code(filename: str, known_codes: set[str]) -> str | None:
+    """Return the single known code (contract or EMB) contained in the filename, else None.
+
+    Real artwork filenames embed the code with no delimiter (e.g. ``APFGNCAL``
+    for ``CAL``), so this checks for containment against every known code
+    rather than trying to tokenise the filename.
+    """
+    stem = re.sub(r"[^A-Z0-9]", "", Path(filename).stem.upper())
+    matches = {code for code in known_codes if code and code in stem}
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
+def _scale_box(box: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
+    ref_w, ref_h = ARTWORK_REF_SIZE
+    x0, y0, x1, y1 = box
+    return (round(x0 * width / ref_w), round(y0 * height / ref_h),
+            round(x1 * width / ref_w), round(y1 * height / ref_h))
+
+
+def extract_artwork_crops(image_path: Path) -> tuple[bytes, bytes] | None:
+    """Crop the isolated front/back embroidery art out of a spec-sheet image.
+
+    Returns (front_png_bytes, back_png_bytes), or None if the file isn't a
+    readable image or doesn't look like this template (aspect ratio too far
+    off ARTWORK_REF_SIZE for the calibrated boxes to be trustworthy).
+    """
     try:
-        raise SystemExit(main())
-    except RuntimeError as error:
-        print(f"Error: {error}", file=sys.stderr)
-        raise SystemExit(1)
+        with PILImage.open(image_path) as source:
+            image = source.convert("RGB")
+    except Exception:
+        return None
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        return None
+    aspect = width / height
+    if abs(aspect - _ARTWORK_REF_ASPECT) / _ARTWORK_REF_ASPECT > 0.08:
+        return None
+    front_buffer, back_buffer = io.BytesIO(), io.BytesIO()
+    image.crop(_scale_box(FRONT_ART_BOX_REF, width, height)).save(front_buffer, format="PNG")
+    image.crop(_scale_box(BACK_ART_BOX_REF, width, height)).save(back_buffer, format="PNG")
+    return front_buffer.getvalue(), back_buffer.getvalue()
+
+
+def _fit_within(data: bytes, max_width: int, max_height: int) -> tuple[int, int]:
+    with PILImage.open(io.BytesIO(data)) as image:
+        source_width, source_height = image.size
+    if source_width <= 0 or source_height <= 0:
+        return max_width, max_height
+    scale = min(max_width / source_width, max_height / source_height)
+    return max(1, round(source_width * scale)), max(1, round(source_height * scale))
+
+
+def add_artwork_to_row(sheet: Any, row: int, column_letter: str, image_bytes: bytes, box: tuple[int, int]) -> None:
+    """Place one artwork image in a row's cell, fit (aspect-preserved) into the blueprint's own sample-image box."""
+    max_width, max_height = box
+    width, height = _fit_within(image_bytes, max_width, max_height)
+    image = ExcelImage(io.BytesIO(image_bytes))
+    image.width, image.height = width, height
+    sheet.add_image(image, f"{column_letter}{row}")

@@ -3,32 +3,90 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>PDF to Plan Sheet</title>
+    <title>Plan Sheet Builder</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=IBM+Plex+Mono:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/styles.css">
   </head>
   <body>
-    <main class="card">
-      <p class="eyebrow">PLAN SHEET CONVERTER</p>
-      <h1>Turn a purchase order PDF into an Excel plan sheet.</h1>
-      <p class="intro">Upload a purchase order, choose the Excel filename, then download the completed sheet.</p>
+    <div class="sheet">
+      <header class="masthead">
+        <p class="eyebrow">WORK ORDER</p>
+        <h1>Turn a purchase order into a finished plan sheet.</h1>
+        <p class="lede">Two stations. Add the purchase order, then add the artwork — we'll build the spreadsheet in between.</p>
+      </header>
 
-      <form id="convert-form">
-        <label class="dropzone" id="dropzone" for="pdf">
-          <input id="pdf" name="pdf" type="file" accept="application/pdf,.pdf" required>
-          <strong id="file-label">Drop a PDF here or choose a file</strong>
-          <span>PDF only · up to 25 MB</span>
-        </label>
+      <ol class="stations">
+        <!-- STATION 1 — PURCHASE ORDER -->
+        <li class="station" id="station-1" data-state="active">
+          <div class="station-rail" aria-hidden="true"></div>
+          <div class="station-body">
+            <p class="station-label">Station 1 <span class="station-sep">·</span> Purchase order</p>
 
-        <label class="field" for="download-name">
-          Download filename
-          <input id="download-name" name="download-name" type="text" value="plan_sheet" maxlength="175" required>
-          <small>.xlsx is added automatically.</small>
-        </label>
+            <form id="convert-form" class="station-form">
+              <p class="station-prompt">Add the purchase order PDF.</p>
+              <p class="station-help">Covering more than one PO in this batch? Add every PDF at once — each gets its own sheet in the workbook.</p>
 
-        <button id="submit" type="submit">Create Excel sheet</button>
-        <p id="status" role="status" aria-live="polite"></p>
-      </form>
-    </main>
+              <label class="dropzone" id="po-dropzone" for="pdf">
+                <input id="pdf" type="file" accept="application/pdf,.pdf" multiple required>
+                <strong id="po-label">Drop PO PDFs here, or click to choose</strong>
+                <span>PDF only · up to 25 MB each</span>
+              </label>
+              <ul class="file-list" id="po-file-list" hidden></ul>
+
+              <button id="create" type="submit" class="btn btn-primary">Build the plan sheet</button>
+            </form>
+
+            <div class="receipt" id="station-1-receipt" hidden>
+              <span class="stamp stamp-good">Logged</span>
+              <p class="receipt-line" id="station-1-summary"></p>
+              <ul class="receipt-sheets" id="station-1-sheets"></ul>
+              <div class="receipt-actions">
+                <a id="sheet-link" class="link-quiet">Download this workbook without artwork</a>
+              </div>
+            </div>
+          </div>
+        </li>
+
+        <!-- STATION 2 — ARTWORK -->
+        <li class="station" id="station-2" data-state="locked">
+          <div class="station-rail" aria-hidden="true"></div>
+          <div class="station-body">
+            <p class="station-label">Station 2 <span class="station-sep">·</span> Artwork</p>
+            <p class="station-locked-note" id="station-2-locked-note">Waiting on Station 1.</p>
+
+            <form id="artwork-form" class="station-form" hidden>
+              <p class="station-prompt">Now add the artwork.</p>
+              <p class="station-help">Select every spec-sheet image for this batch — the whole folder is fine. Each filename just needs the contract code somewhere in it, like <code>CAL65393FGE_Mocksville.jpg</code>. We'll match the rest and crop out the embroidery art automatically.</p>
+
+              <label class="dropzone" id="artwork-dropzone" for="artwork">
+                <input id="artwork" type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" multiple required>
+                <strong id="artwork-label">Drop spec-sheet images here, or click to choose</strong>
+                <span>JPG or PNG · up to 25 MB each</span>
+              </label>
+              <ul class="file-list" id="artwork-file-list" hidden></ul>
+
+              <button id="finish" type="submit" class="btn btn-primary">Match the artwork</button>
+            </form>
+
+            <div class="receipt" id="station-2-receipt" hidden>
+              <span class="stamp stamp-good" id="station-2-stamp">Matched</span>
+              <p class="receipt-line" id="station-2-summary"></p>
+
+              <section class="manifest" id="manifest" aria-label="Artwork matching results"></section>
+
+              <div class="receipt-actions receipt-actions-primary">
+                <a id="final-link" class="btn btn-primary">Download the finished plan sheet</a>
+                <button type="button" id="print-manifest" class="link-quiet">Print this report</button>
+              </div>
+            </div>
+          </div>
+        </li>
+      </ol>
+
+      <p id="status" role="status" aria-live="polite"></p>
+    </div>
     <script src="/static/app.js"></script>
   </body>
 </html>
