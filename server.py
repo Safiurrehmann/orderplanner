@@ -17,6 +17,7 @@ from openpyxl import load_workbook
 
 from extract_to_plan_sheet import (
     FIRST_DATA_ROW,
+    WORKBOOK_FORMATS,
     add_artwork_to_row,
     build_workbook,
     extract_artwork_crops,
@@ -25,7 +26,6 @@ from extract_to_plan_sheet import (
 )
 
 APP_DIR = Path(__file__).resolve().parent
-TEMPLATE_PATH = APP_DIR / "PLAN SHEET.xlsx"
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_PO_FILES = 25
 MAX_ARTWORK_FILES = 200
@@ -78,8 +78,9 @@ def homepage() -> FileResponse:
 @app.get("/health", include_in_schema=False)
 def health() -> dict[str, str]:
     """Liveness/readiness check for the host (e.g. Render) -- cheap, no session state involved."""
-    if not TEMPLATE_PATH.is_file():
-        raise HTTPException(status_code=503, detail="The workbook blueprint is missing from the server.")
+    missing = [fmt.label for fmt in WORKBOOK_FORMATS.values() if not fmt.template_path.is_file()]
+    if missing:
+        raise HTTPException(status_code=503, detail=f"Missing workbook blueprint(s): {', '.join(missing)}.")
     return {"status": "ok"}
 
 
@@ -89,9 +90,12 @@ def default_workbook_name(sheet_titles: list[str]) -> str:
 
 
 @app.post("/api/convert")
-async def convert_pdf(pdfs: list[UploadFile] = File(...)) -> dict[str, object]:
-    if not TEMPLATE_PATH.is_file():
-        raise HTTPException(status_code=500, detail="The workbook blueprint is missing from the server.")
+async def convert_pdf(format: str = Form(...), pdfs: list[UploadFile] = File(...)) -> dict[str, object]:
+    fmt = WORKBOOK_FORMATS.get(format)
+    if fmt is None:
+        raise HTTPException(status_code=400, detail=f"Unknown workbook format {format!r}.")
+    if not fmt.template_path.is_file():
+        raise HTTPException(status_code=500, detail=f"The {fmt.label} workbook blueprint is missing from the server.")
     if not pdfs:
         raise HTTPException(status_code=400, detail="Add at least one purchase-order PDF.")
     if len(pdfs) > MAX_PO_FILES:
@@ -116,14 +120,14 @@ async def convert_pdf(pdfs: list[UploadFile] = File(...)) -> dict[str, object]:
             seen_po_numbers[po_number] = upload.filename or source.name
             purchase_orders.append((po_number, rows))
         output = workdir / "plan_sheet.xlsx"
-        result = build_workbook(TEMPLATE_PATH, output, purchase_orders)
+        result = build_workbook(fmt, output, purchase_orders)
         sheet_rows = result["sheets"]
         workbook_name = default_workbook_name(list(sheet_rows.keys()))
         (workdir / "meta.json").write_text(
             json.dumps({
                 "name": workbook_name,
                 "sheets": sheet_rows,
-                "artwork_box": result["artwork_box"],
+                "format": fmt.key,
             }),
             encoding="utf-8",
         )
@@ -158,14 +162,13 @@ async def enrich_workbook(session_id: str = Form(...), artwork: list[UploadFile]
 
     workdir = get_session(session_id)
     meta = json.loads((workdir / "meta.json").read_text(encoding="utf-8"))
+    fmt = WORKBOOK_FORMATS[meta["format"]]
     known_contracts = {
         str(row["contract"]).upper()
         for rows in meta["sheets"].values()
         for row in rows
         if row.get("contract")
     }
-    back_box = tuple(meta["artwork_box"]["back"])
-    front_box = tuple(meta["artwork_box"]["front"])
     report: dict[str, list[str]] = {key: [] for key in REPORT_KEYS}
 
     # Each upload is one contract's spec-sheet image (JPG/PNG), matched by the
@@ -208,8 +211,9 @@ async def enrich_workbook(session_id: str = Form(...), artwork: list[UploadFile]
             contract = str(contract).upper()
             if contract in resolved:
                 front_bytes, back_bytes = resolved[contract]
-                add_artwork_to_row(sheet, row, "F", back_bytes, back_box)
-                add_artwork_to_row(sheet, row, "G", front_bytes, front_box)
+                crops = {"front": front_bytes, "back": back_bytes}
+                for slot in fmt.image_slots:
+                    add_artwork_to_row(sheet, row, slot.column, crops[slot.source], slot.box)
     workbook.save(workdir / "completed_plan_sheet.xlsx")
     contract_count = len(known_contracts)
     return {

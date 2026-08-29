@@ -25,8 +25,15 @@
             <p class="station-label">Station 1 <span class="station-sep">·</span> Purchase order</p>
 
             <form id="convert-form" class="station-form">
-              <p class="station-prompt">Add the purchase order PDF.</p>
+              <p class="station-prompt">Choose the workbook template, then add the purchase order PDF.</p>
               <p class="station-help">Covering more than one PO in this batch? Add every PDF at once — each gets its own sheet in the workbook.</p>
+
+              <label class="field-label" for="workbook-format">Workbook template</label>
+              <select id="workbook-format" name="format" required>
+                <option value="mocktail">Mocktail — back &amp; front artwork</option>
+                <option value="flannigan">Flannigan — front artwork only</option>
+                <option value="belvedere">Belvedere — back, front &amp; head artwork</option>
+              </select>
 
               <label class="dropzone" id="po-dropzone" for="pdf">
                 <input id="pdf" type="file" accept="application/pdf,.pdf" multiple required>
@@ -58,7 +65,7 @@
 
             <form id="artwork-form" class="station-form" hidden>
               <p class="station-prompt">Now add the artwork.</p>
-              <p class="station-help">Select every spec-sheet image for this batch — the whole folder is fine. Each filename just needs the contract code somewhere in it, like <code>CAL65393FGE_Mocksville.jpg</code>. We'll match the rest and crop out the embroidery art automatically.</p>
+              <p class="station-help">Select every spec-sheet image for this batch — the whole folder is fine. Each filename just needs the team code somewhere in it, like <code>CAL65393FGE_Mocksville.jpg</code>. We'll match the rest and crop out the embroidery art automatically.</p>
 
               <label class="dropzone" id="artwork-dropzone" for="artwork">
                 <input id="artwork" type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" multiple required>

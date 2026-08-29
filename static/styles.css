@@ -178,6 +178,36 @@ h1 {
 
 .station-form { display: grid; gap: 12px; }
 
+/* ---------- Field (format select) ---------- */
+
+.field-label {
+  font-family: var(--font-mono);
+  font-size: .74rem;
+  font-weight: 600;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+  margin: 2px 0 -4px;
+}
+
+select {
+  appearance: none;
+  width: 100%;
+  padding: 13px 40px 13px 16px;
+  background: var(--paper-card) url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="12" height="8" viewBox="0 0 12 8"><path d="M1 1l5 5 5-5" fill="none" stroke="%2357626c" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>') no-repeat right 16px center;
+  border: 2px solid var(--line-strong);
+  border-radius: 10px;
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: .96rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color .15s ease;
+}
+
+select:hover { border-color: var(--ink-faint); }
+select:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
 /* ---------- Dropzone ---------- */
 
 .dropzone {

@@ -82,6 +82,7 @@ convertForm.addEventListener('submit', async (event) => {
   announce('Reading the purchase order…');
   try {
     const data = new FormData();
+    data.append('format', document.querySelector('#workbook-format').value);
     [...pdfs].forEach((file) => data.append('pdfs', file));
     const result = await requestJson('/api/convert', data);
     sessionId = result.session_id;
@@ -115,27 +116,27 @@ convertForm.addEventListener('submit', async (event) => {
 const MANIFEST_CATEGORIES = [
   {
     key: 'matched', tone: 'good', title: 'Matched',
-    desc: 'Artwork was found and placed on the sheet for these contracts.',
+    desc: 'Artwork was found and placed on the sheet for these teams.',
     render: 'chips',
   },
   {
     key: 'missing', tone: 'warn', title: 'Needs artwork',
-    desc: "No spec-sheet image was uploaded for these contracts. Their artwork cells were left blank.",
+    desc: "No spec-sheet image was uploaded for these teams. Their artwork cells were left blank.",
     render: 'chips',
   },
   {
     key: 'duplicate', tone: 'bad', title: 'Uploaded twice',
-    desc: 'More than one file matched the same contract, so neither was used — rather than guess. Rename the extra file and re-add it.',
+    desc: 'More than one file matched the same team, so neither was used — rather than guess. Rename the extra file and re-add it.',
     render: 'list',
   },
   {
     key: 'unreadable', tone: 'bad', title: "Couldn't read",
-    desc: "Matched a contract, but the image didn't look like the expected spec-sheet layout, so it was skipped.",
+    desc: "Matched a team, but the image didn't look like the expected spec-sheet layout, so it was skipped.",
     render: 'list',
   },
   {
     key: 'unused', tone: 'neutral', title: "Didn't match anything",
-    desc: "These filenames didn't contain a contract code from this workbook.",
+    desc: "These filenames didn't contain a team code from this workbook.",
     render: 'list',
   },
 ];
@@ -178,7 +179,7 @@ artworkForm.addEventListener('submit', async (event) => {
   if (!sessionId || !files.length) return;
   const button = document.querySelector('#finish');
   button.disabled = true;
-  announce('Matching artwork to contracts…');
+  announce('Matching artwork to teams…');
   try {
     const data = new FormData();
     data.append('session_id', sessionId);
@@ -192,7 +193,7 @@ artworkForm.addEventListener('submit', async (event) => {
     stamp.className = `stamp ${clean ? 'stamp-good' : 'stamp-warn'}`;
 
     document.querySelector('#station-2-summary').textContent =
-      `${result.matched_count} of ${result.contract_count} contracts matched.`;
+      `${result.matched_count} of ${result.contract_count} teams matched.`;
     renderManifest(result.report);
     document.querySelector('#final-link').href = result.download_url;
 
