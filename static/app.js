@@ -25,29 +25,33 @@ function configureDropzone({ zoneId, inputId, labelId, listId, predicate, invali
   const label = document.querySelector(labelId);
   const list = document.querySelector(listId);
 
-  function setFiles(files) {
+  function displayFiles(files) {
     if (!files?.length) return;
     if (![...files].every(predicate)) {
       announce(invalidMessage);
-      return;
+      return false;
     }
-    const transfer = new DataTransfer();
-    [...files].forEach((file) => transfer.items.add(file));
-    input.files = transfer.files;
     label.textContent = `${files.length} ${noun}${files.length === 1 ? '' : 's'} ready`;
     list.innerHTML = [...files].map((file) => `<li>${escapeHtml(file.name)}</li>`).join('');
     list.hidden = false;
     announce('');
+    return true;
   }
 
-  input.addEventListener('change', () => setFiles(input.files));
+  // The browser has already populated input.files for picker selections. Do not
+  // rebuild it through DataTransfer: that constructor is unavailable or blocked
+  // in some Windows/browser combinations.
+  input.addEventListener('change', () => displayFiles(input.files));
   ['dragenter', 'dragover'].forEach((name) => zone.addEventListener(name, (event) => {
     event.preventDefault(); zone.classList.add('dragging');
   }));
   ['dragleave', 'drop'].forEach((name) => zone.addEventListener(name, (event) => {
     event.preventDefault(); zone.classList.remove('dragging');
   }));
-  zone.addEventListener('drop', (event) => setFiles(event.dataTransfer.files));
+  zone.addEventListener('drop', (event) => {
+    const files = event.dataTransfer.files;
+    if (displayFiles(files)) input.files = files;
+  });
 }
 
 configureDropzone({
