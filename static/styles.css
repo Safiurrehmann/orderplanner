@@ -429,6 +429,14 @@ select:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
   border-bottom: 1px solid var(--line);
 }
 
+.manifest-list .detail {
+  overflow-wrap: anywhere;
+}
+
+.manifest-list li[data-tone="good"]::marker { color: var(--thread); }
+.manifest-list li[data-tone="warn"]::marker { color: var(--flag); }
+.manifest-list li[data-tone="bad"]::marker { color: var(--stamp-red); }
+
 .manifest-empty {
   color: var(--ink-faint);
   font-size: .85rem;

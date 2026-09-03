@@ -25,17 +25,11 @@ INVALID_SHEET_CHARS = re.compile(r"[:\\/?*\[\]]")
 # Pressbox "tech pack" export) that contains, among other things, two garment
 # mockup photos AND two separate bordered boxes lower on the page holding the
 # actual isolated embroidery art -- a compact front/chest logo on the left and
-# a wide back wordmark on the right. Those two boxes are what get cropped out;
-# the mockup photos are not used. Box positions are calibrated as pixel
-# offsets against ARTWORK_REF_SIZE (measured from real sample files) and then
-# scaled to each upload's actual size, since exports vary by a few pixels.
-# Confirmed identical across all three garment styles/workbook formats --
-# every sample spec-sheet checked (Mocktail, Belvedere, Flannigan) is exactly
-# ARTWORK_REF_SIZE with the front box on the left and the back box on the
-# right, so one calibration serves every format.
+# a wide back wordmark on the right. Those two bordered panels are what get
+# cropped out; the mockup photos are not used. Their positions differ between
+# garment styles (notably Belvedere and Flannigan), so extraction finds the
+# panel borders in each image instead of applying one shared fixed crop.
 ARTWORK_REF_SIZE = (1508, 1134)
-FRONT_ART_BOX_REF = (37, 619, 498, 912)
-BACK_ART_BOX_REF = (562, 619, 1473, 912)
 _ARTWORK_REF_ASPECT = ARTWORK_REF_SIZE[0] / ARTWORK_REF_SIZE[1]
 
 
@@ -99,7 +93,7 @@ WORKBOOK_FORMATS: dict[str, WorkbookFormat] = {
         image_slots=(
             ImageSlot("F", (184, 49), "back"),
             ImageSlot("G", (81, 65), "front"),
-            ImageSlot("H", (81, 65), "front"),
+            ImageSlot("H", (81, 65), "hood"),
         ),
         quantity_column=9,
     ),
@@ -263,24 +257,86 @@ def find_known_code(filename: str, known_codes: set[str]) -> str | None:
     return next(iter(matches)) if len(matches) == 1 else None
 
 
-def _scale_box(box: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
-    ref_w, ref_h = ARTWORK_REF_SIZE
-    x0, y0, x1, y1 = box
-    return (round(x0 * width / ref_w), round(y0 * height / ref_h),
-            round(x1 * width / ref_w), round(y1 * height / ref_h))
+def _runs(indexes: list[int]) -> list[tuple[int, int]]:
+    """Collapse adjacent indexes into inclusive (start, end) runs."""
+    if not indexes:
+        return []
+    runs: list[tuple[int, int]] = []
+    start = previous = indexes[0]
+    for index in indexes[1:]:
+        if index > previous + 1:
+            runs.append((start, previous))
+            start = index
+        previous = index
+    runs.append((start, previous))
+    return runs
 
 
-def extract_artwork_crops(image_path: Path) -> tuple[bytes, bytes] | None:
+def _find_artwork_boxes(image: PILImage.Image) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]] | None:
+    """Locate the two large bordered artwork panels in a Royce spec sheet.
+
+    The panels occupy the lower-middle portion of every supported sheet, but
+    their top edge and divider positions vary by garment style. Long, nearly
+    solid dark runs identify the four vertical and two horizontal borders;
+    returning the interiors excludes both borders and the neighbouring panel.
+    """
+    grayscale = image.convert("L")
+    pixels = grayscale.load()
+    width, height = grayscale.size
+    scan_y0, scan_y1 = round(height * 0.50), round(height * 0.84)
+    vertical_indexes = []
+    vertical_threshold = 0.68
+    for x in range(width):
+        dark = sum(pixels[x, y] < 70 for y in range(scan_y0, scan_y1))
+        if dark / (scan_y1 - scan_y0) >= vertical_threshold:
+            vertical_indexes.append(x)
+    # Panel borders are narrow. Wide dark runs are artwork (for example a
+    # block letter touching much of the panel height), not dividers.
+    vertical_runs = [run for run in _runs(vertical_indexes) if run[1] - run[0] + 1 <= max(8, round(width * 0.006))]
+    left_runs = [run for run in vertical_runs if width * 0.005 <= run[0] <= width * 0.08]
+    middle_runs = [run for run in vertical_runs if width * 0.20 <= run[0] <= width * 0.45]
+    right_runs = [run for run in vertical_runs if width * 0.85 <= run[0] <= width * 0.995]
+    if not left_runs or len(middle_runs) < 2 or not right_runs:
+        return None
+    left, front_right, back_left, right = left_runs[0], middle_runs[0], middle_runs[-1], right_runs[-1]
+
+    scan_x0, scan_x1 = left[0], right[1] + 1
+    horizontal_indexes = []
+    # Belvedere's two panel borders cover about 63% of the full span because
+    # of their rounded corners and wider gap; Flannigan is closer to 77%.
+    horizontal_threshold = 0.60
+    for y in range(round(height * 0.48), round(height * 0.84)):
+        dark = sum(pixels[x, y] < 70 for x in range(scan_x0, scan_x1))
+        if dark / (scan_x1 - scan_x0) >= horizontal_threshold:
+            horizontal_indexes.append(y)
+    horizontal_runs = _runs(horizontal_indexes)
+    if not horizontal_runs:
+        return None
+    top = horizontal_runs[0]
+    bottom_candidates = [run for run in horizontal_runs[1:] if run[0] >= top[1] + round(height * 0.20)]
+    if not bottom_candidates:
+        return None
+    bottom = bottom_candidates[0]
+
+    y0, y1 = top[1] + 1, bottom[0]
+    front_box = (left[1] + 1, y0, front_right[0], y1)
+    back_box = (back_left[1] + 1, y0, right[0], y1)
+    if min(front_box[2] - front_box[0], back_box[2] - back_box[0], y1 - y0) <= 0:
+        return None
+    return front_box, back_box
+
+
+def extract_artwork_crops_bytes(data: bytes) -> tuple[bytes, bytes] | None:
     """Crop the isolated front/back embroidery art out of a spec-sheet image.
 
     Returns (front_png_bytes, back_png_bytes), or None if the file isn't a
-    readable image or doesn't look like this template (aspect ratio too far
-    off ARTWORK_REF_SIZE for the calibrated boxes to be trustworthy). Callers
+    readable image or doesn't look like a supported template (aspect ratio too
+    far off ARTWORK_REF_SIZE, or artwork-panel borders cannot be found). Callers
     that only need one side (e.g. Flannigan's front-only slot) simply ignore
     the other element of the tuple.
     """
     try:
-        with PILImage.open(image_path) as source:
+        with PILImage.open(io.BytesIO(data)) as source:
             image = source.convert("RGB")
     except Exception:
         return None
@@ -290,10 +346,22 @@ def extract_artwork_crops(image_path: Path) -> tuple[bytes, bytes] | None:
     aspect = width / height
     if abs(aspect - _ARTWORK_REF_ASPECT) / _ARTWORK_REF_ASPECT > 0.08:
         return None
+    boxes = _find_artwork_boxes(image)
+    if boxes is None:
+        return None
+    front_box, back_box = boxes
     front_buffer, back_buffer = io.BytesIO(), io.BytesIO()
-    image.crop(_scale_box(FRONT_ART_BOX_REF, width, height)).save(front_buffer, format="PNG")
-    image.crop(_scale_box(BACK_ART_BOX_REF, width, height)).save(back_buffer, format="PNG")
+    image.crop(front_box).save(front_buffer, format="PNG")
+    image.crop(back_box).save(back_buffer, format="PNG")
     return front_buffer.getvalue(), back_buffer.getvalue()
+
+
+def extract_artwork_crops(image_path: Path) -> tuple[bytes, bytes] | None:
+    """Path-compatible wrapper around the in-memory package extractor."""
+    try:
+        return extract_artwork_crops_bytes(image_path.read_bytes())
+    except OSError:
+        return None
 
 
 def _fit_within(data: bytes, max_width: int, max_height: int) -> tuple[int, int]:

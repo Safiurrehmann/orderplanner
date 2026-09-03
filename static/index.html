@@ -65,16 +65,16 @@
 
             <form id="artwork-form" class="station-form" hidden>
               <p class="station-prompt">Now add the artwork.</p>
-              <p class="station-help">Select every spec-sheet image for this batch — the whole folder is fine. Each filename just needs the team code somewhere in it, like <code>CAL65393FGE_Mocksville.jpg</code>. We'll match the rest and crop out the embroidery art automatically.</p>
+              <p class="station-help">Upload the complete artwork package as one ZIP. Keep its original folders and filenames — we'll unpack it, match each team and embroidery position, and use the clean PDF/PSD artwork whenever available.</p>
 
               <label class="dropzone" id="artwork-dropzone" for="artwork">
-                <input id="artwork" type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" multiple required>
-                <strong id="artwork-label">Drop spec-sheet images here, or click to choose</strong>
-                <span>JPG or PNG · up to 25 MB each</span>
+                <input id="artwork" name="package" type="file" accept="application/zip,.zip" required>
+                <strong id="artwork-label">Drop the artwork ZIP here, or click to choose</strong>
+                <span>One ZIP · up to 75 MB compressed</span>
               </label>
               <ul class="file-list" id="artwork-file-list" hidden></ul>
 
-              <button id="finish" type="submit" class="btn btn-primary">Match the artwork</button>
+              <button id="finish" type="submit" class="btn btn-primary">Unpack &amp; match artwork</button>
             </form>
 
             <div class="receipt" id="station-2-receipt" hidden>

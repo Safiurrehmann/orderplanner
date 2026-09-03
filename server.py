@@ -15,22 +15,20 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from openpyxl import load_workbook
 
+from artwork_archive import ArchiveError
+from artwork_package import resolve_artwork_package
 from extract_to_plan_sheet import (
     FIRST_DATA_ROW,
     WORKBOOK_FORMATS,
     add_artwork_to_row,
     build_workbook,
-    extract_artwork_crops,
     extract_purchase_order,
-    find_known_code,
 )
 
 APP_DIR = Path(__file__).resolve().parent
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_PO_FILES = 25
-MAX_ARTWORK_FILES = 200
-IMAGE_MAGIC_BYTES = (b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n")  # JPEG, PNG
-REPORT_KEYS = ("matched", "missing", "unused", "duplicate", "unreadable")
+ZIP_MAGIC_BYTES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 sessions: dict[str, Path] = {}
 
 app = FastAPI(title="PDF to Plan Sheet", docs_url=None, redoc_url=None)
@@ -57,10 +55,6 @@ async def save_upload(upload: UploadFile, directory: Path, name: str, magic_byte
 
 async def save_pdf(upload: UploadFile, directory: Path, name: str) -> Path:
     return await save_upload(upload, directory, name, (b"%PDF",), "PDF")
-
-
-async def save_image(upload: UploadFile, directory: Path, name: str) -> Path:
-    return await save_upload(upload, directory, name, IMAGE_MAGIC_BYTES, "JPG/PNG")
 
 
 def get_session(session_id: str) -> Path:
@@ -154,12 +148,7 @@ async def convert_pdf(format: str = Form(...), pdfs: list[UploadFile] = File(...
 
 
 @app.post("/api/enrich")
-async def enrich_workbook(session_id: str = Form(...), artwork: list[UploadFile] = File(...)) -> dict[str, object]:
-    if not artwork:
-        raise HTTPException(status_code=400, detail="Add at least one spec-sheet image before matching.")
-    if len(artwork) > MAX_ARTWORK_FILES:
-        raise HTTPException(status_code=413, detail=f"Add at most {MAX_ARTWORK_FILES} artwork files at once.")
-
+async def enrich_workbook(session_id: str = Form(...), package: UploadFile = File(...)) -> dict[str, object]:
     workdir = get_session(session_id)
     meta = json.loads((workdir / "meta.json").read_text(encoding="utf-8"))
     fmt = WORKBOOK_FORMATS[meta["format"]]
@@ -169,38 +158,14 @@ async def enrich_workbook(session_id: str = Form(...), artwork: list[UploadFile]
         for row in rows
         if row.get("contract")
     }
-    report: dict[str, list[str]] = {key: [] for key in REPORT_KEYS}
-
-    # Each upload is one contract's spec-sheet image (JPG/PNG), matched by the
-    # full contract code embedded in its filename -- not a per-side batch, since
-    # one file holds both the front and back art (see extract_artwork_crops).
-    upload_dir = workdir / "artwork"
-    upload_dir.mkdir(exist_ok=True)
-    by_contract: dict[str, list[tuple[str, Path]]] = {}
-    for index, item in enumerate(artwork):
-        filename = item.filename or f"artwork_{index}.jpg"
-        path = await save_image(item, upload_dir, f"{index}.jpg")
-        contract = find_known_code(filename, known_contracts)
-        if not contract:
-            report["unused"].append(filename)
-            continue
-        by_contract.setdefault(contract, []).append((filename, path))
-
-    resolved: dict[str, tuple[bytes, bytes]] = {}
-    accounted: set[str] = set()
-    for contract, matches in sorted(by_contract.items()):
-        accounted.add(contract)
-        if len(matches) > 1:
-            report["duplicate"].append(f"{contract}: " + ", ".join(name for name, _ in matches))
-            continue
-        filename, path = matches[0]
-        crops = extract_artwork_crops(path)
-        if crops is None:
-            report["unreadable"].append(f"{contract} ({filename})")
-            continue
-        resolved[contract] = crops
-        report["matched"].append(contract)
-    report["missing"].extend(sorted(known_contracts - accounted))
+    contents = await package.read()
+    filename = package.filename or ""
+    if not filename.lower().endswith(".zip") or not contents.startswith(ZIP_MAGIC_BYTES):
+        raise HTTPException(status_code=400, detail="Upload one valid ZIP artwork package.")
+    try:
+        resolution = resolve_artwork_package(contents, fmt.key, known_contracts)
+    except ArchiveError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     workbook = load_workbook(workdir / "plan_sheet.xlsx")
     for sheet in workbook.worksheets:
@@ -209,18 +174,18 @@ async def enrich_workbook(session_id: str = Form(...), artwork: list[UploadFile]
             if not contract:
                 continue
             contract = str(contract).upper()
-            if contract in resolved:
-                front_bytes, back_bytes = resolved[contract]
-                crops = {"front": front_bytes, "back": back_bytes}
-                for slot in fmt.image_slots:
-                    add_artwork_to_row(sheet, row, slot.column, crops[slot.source], slot.box)
+            for slot in fmt.image_slots:
+                image_bytes = resolution.slots.get((contract, slot.source))
+                if image_bytes:
+                    add_artwork_to_row(sheet, row, slot.column, image_bytes, slot.box)
     workbook.save(workdir / "completed_plan_sheet.xlsx")
-    contract_count = len(known_contracts)
+    records = [record.to_dict() for record in resolution.records]
     return {
         "download_url": f"/api/session/{session_id}/completed",
-        "report": report,
-        "matched_count": len(report["matched"]),
-        "contract_count": contract_count,
+        "report": {"records": records, "ignored": list(resolution.ignored)},
+        "matched_count": sum(record["status"] in {"matched", "fallback"} for record in records),
+        "fallback_count": sum(record["status"] == "fallback" for record in records),
+        "slot_count": len(records),
     }
 
 

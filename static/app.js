@@ -17,7 +17,7 @@ function escapeHtml(value) {
 // ---------- Dropzones ----------
 
 const isPdf = (file) => file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
-const isImage = (file) => file.type.startsWith('image/') || /\.(jpe?g|png)$/i.test(file.name);
+const isZip = (file) => file.type === 'application/zip' || /\.zip$/i.test(file.name);
 
 function configureDropzone({ zoneId, inputId, labelId, listId, predicate, invalidMessage, defaultLabel, noun }) {
   const zone = document.querySelector(zoneId);
@@ -58,8 +58,8 @@ configureDropzone({
 
 configureDropzone({
   zoneId: '#artwork-dropzone', inputId: '#artwork', labelId: '#artwork-label', listId: '#artwork-file-list',
-  predicate: isImage, invalidMessage: 'That needs to be a JPG or PNG spec-sheet image.',
-  defaultLabel: 'Drop spec-sheet images here, or click to choose', noun: 'image',
+  predicate: isZip, invalidMessage: 'Upload one ZIP artwork package.',
+  defaultLabel: 'Drop the artwork ZIP here, or click to choose', noun: 'package',
 });
 
 // ---------- Networking ----------
@@ -113,87 +113,54 @@ convertForm.addEventListener('submit', async (event) => {
 
 // ---------- Station 2: artwork ----------
 
-const MANIFEST_CATEGORIES = [
-  {
-    key: 'matched', tone: 'good', title: 'Matched',
-    desc: 'Artwork was found and placed on the sheet for these teams.',
-    render: 'chips',
-  },
-  {
-    key: 'missing', tone: 'warn', title: 'Needs artwork',
-    desc: "No spec-sheet image was uploaded for these teams. Their artwork cells were left blank.",
-    render: 'chips',
-  },
-  {
-    key: 'duplicate', tone: 'bad', title: 'Uploaded twice',
-    desc: 'More than one file matched the same team, so neither was used — rather than guess. Rename the extra file and re-add it.',
-    render: 'list',
-  },
-  {
-    key: 'unreadable', tone: 'bad', title: "Couldn't read",
-    desc: "Matched a team, but the image didn't look like the expected spec-sheet layout, so it was skipped.",
-    render: 'list',
-  },
-  {
-    key: 'unused', tone: 'neutral', title: "Didn't match anything",
-    desc: "These filenames didn't contain a team code from this workbook.",
-    render: 'list',
-  },
-];
-
-function splitLeadingCode(item) {
-  const match = item.match(/^(.*?)([:(].*)$/);
-  return match ? [match[1].trim(), match[2].trim()] : [item, ''];
-}
+const RESULT_COPY = {
+  matched: ['good', 'Source artwork inserted'],
+  fallback: ['good', 'Inserted from spec-sheet JPG'],
+  missing: ['warn', 'Artwork missing'],
+  ambiguous: ['bad', 'Multiple possible files — nothing inserted'],
+  unreadable: ['bad', 'Matched file could not be used'],
+};
 
 function renderManifest(report) {
   const manifest = document.querySelector('#manifest');
-  manifest.innerHTML = MANIFEST_CATEGORIES.map(({ key, tone, title, desc, render }) => {
-    const items = report[key] || [];
-    let body;
-    if (!items.length) {
-      body = '<p class="manifest-empty">None.</p>';
-    } else if (render === 'chips') {
-      body = `<div class="chips">${items.map((item) => `<span class="chip">${escapeHtml(item)}</span>`).join('')}</div>`;
-    } else {
-      body = `<ul class="manifest-list">${items.map((item) => {
-        const [code, detail] = splitLeadingCode(item);
-        return `<li><code>${escapeHtml(code)}</code> <span class="detail">${escapeHtml(detail)}</span></li>`;
-      }).join('')}</ul>`;
-    }
-    return `
-      <div class="manifest-card" data-tone="${tone}">
+  const groups = (report.records || []).reduce((result, record) => {
+    (result[record.contract] ||= []).push(record);
+    return result;
+  }, {});
+  manifest.innerHTML = Object.entries(groups).map(([contract, records]) => `
+      <div class="manifest-card" data-tone="${records.every((item) => ['matched', 'fallback'].includes(item.status)) ? 'good' : 'warn'}">
         <div class="manifest-head">
-          <span class="manifest-title">${escapeHtml(title)}</span>
-          <span class="manifest-count">${items.length}</span>
+          <span class="manifest-title">${escapeHtml(contract)}</span>
+          <span class="manifest-count">${records.filter((item) => ['matched', 'fallback'].includes(item.status)).length}/${records.length}</span>
         </div>
-        <p class="manifest-desc">${escapeHtml(desc)}</p>
-        ${body}
-      </div>`;
-  }).join('');
+        <ul class="manifest-list">${records.map((record) => {
+          const [tone, copy] = RESULT_COPY[record.status] || ['neutral', record.status];
+          const detail = record.path || record.detail || '';
+          return `<li data-tone="${tone}"><code>${escapeHtml(record.position)}</code> <span>${escapeHtml(copy)}</span>${detail ? ` <span class="detail">— ${escapeHtml(detail)}</span>` : ''}</li>`;
+        }).join('')}</ul>
+      </div>`).join('');
 }
 
 artworkForm.addEventListener('submit', async (event) => {
   event.preventDefault();
-  const files = document.querySelector('#artwork').files;
-  if (!sessionId || !files.length) return;
+  const packageFile = document.querySelector('#artwork').files[0];
+  if (!sessionId || !packageFile) return;
   const button = document.querySelector('#finish');
   button.disabled = true;
-  announce('Matching artwork to teams…');
+  announce('Uploading, unpacking, and matching the artwork package…');
   try {
     const data = new FormData();
     data.append('session_id', sessionId);
-    [...files].forEach((file) => data.append('artwork', file));
+    data.append('package', packageFile);
     const result = await requestJson('/api/enrich', data);
 
     const stamp = document.querySelector('#station-2-stamp');
-    const clean = result.matched_count === result.contract_count
-      && !result.report.duplicate.length && !result.report.unreadable.length;
+    const clean = result.matched_count === result.slot_count;
     stamp.textContent = clean ? 'Matched' : 'Check manifest';
     stamp.className = `stamp ${clean ? 'stamp-good' : 'stamp-warn'}`;
 
     document.querySelector('#station-2-summary').textContent =
-      `${result.matched_count} of ${result.contract_count} teams matched.`;
+      `${result.matched_count} of ${result.slot_count} artwork positions matched${result.fallback_count ? ` · ${result.fallback_count} from JPG fallback` : ''}.`;
     renderManifest(result.report);
     document.querySelector('#final-link').href = result.download_url;
 
